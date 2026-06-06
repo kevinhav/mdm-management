@@ -624,6 +624,7 @@ with tab_sql:
                         {
                             "_le_id": m.le.id,
                             "Column": m.pe.column,
+                            "Schema": m.pe.schema,
                             "Table": m.pe.table,
                             "System": m.pe.system,
                             "Logical Element": m.le.name,
