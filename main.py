@@ -316,7 +316,8 @@ def render_detail(
 @dataclass
 class SqlRef:
     table: str
-    column: str | None  # None when SELECT *
+    column: str | None   # None when SELECT *
+    schema: str | None = None
 
 
 @dataclass
@@ -335,21 +336,23 @@ def parse_sql_refs(sql: str) -> tuple[list[SqlRef], str | None]:
     except Exception as e:
         return [], str(e)
 
-    # Build alias map: alias/name → table name (lowercased)
-    alias_map: dict[str, str] = {}
+    # Build alias map: alias/name → (table_name, schema_or_None)
+    alias_map: dict[str, tuple[str, str | None]] = {}
     for table_node in parsed.find_all(exp.Table):
         name = table_node.name.lower()
+        schema = table_node.db.lower() if table_node.db else None
         alias = table_node.alias.lower() if table_node.alias else name
-        alias_map[alias] = name
-        alias_map[name] = name
+        entry = (name, schema)
+        alias_map[alias] = entry
+        alias_map[name] = entry
 
     refs: list[SqlRef] = []
 
     # SELECT * → only triggers when Star is a direct SELECT expression, not inside COUNT(*)
     select_node = parsed.find(exp.Select)
     if select_node and any(isinstance(e, exp.Star) for e in select_node.expressions):
-        for table_name in set(alias_map.values()):
-            refs.append(SqlRef(table=table_name, column=None))
+        for tname, tschema in set(alias_map.values()):
+            refs.append(SqlRef(table=tname, column=None, schema=tschema))
 
     # Collect SELECT-clause aliases so ORDER BY / HAVING alias refs don't leak through
     select_aliases = {
@@ -365,12 +368,13 @@ def parse_sql_refs(sql: str) -> tuple[list[SqlRef], str | None]:
             continue
         qualifier = col_node.table.lower() if col_node.table else None
         if qualifier and qualifier in alias_map:
-            refs.append(SqlRef(table=alias_map[qualifier], column=col_name))
+            tname, tschema = alias_map[qualifier]
+            refs.append(SqlRef(table=tname, column=col_name, schema=tschema))
         elif qualifier:
-            refs.append(SqlRef(table=qualifier, column=col_name))
+            refs.append(SqlRef(table=qualifier, column=col_name, schema=None))
         else:
-            for table_name in set(alias_map.values()):
-                refs.append(SqlRef(table=table_name, column=col_name))
+            for tname, tschema in set(alias_map.values()):
+                refs.append(SqlRef(table=tname, column=col_name, schema=tschema))
 
     return refs, None
 
@@ -389,10 +393,9 @@ def match_elements(
                 for le in entity.logical_elements:
                     for pe in le.physical_elements:
                         table_match = pe.table.lower() == ref.table
-                        col_match = (
-                            ref.column is None or pe.column.lower() == ref.column
-                        )
-                        if table_match and col_match and pe.id not in seen_pe_ids:
+                        schema_match = ref.schema is None or pe.schema.lower() == ref.schema
+                        col_match = ref.column is None or pe.column.lower() == ref.column
+                        if table_match and schema_match and col_match and pe.id not in seen_pe_ids:
                             matched.append(MatchedElement(ref, pe, le, entity, domain))
                             seen_pe_ids.add(pe.id)
                             found = True
@@ -608,11 +611,8 @@ with tab_sql:
             if unmatched:
                 st.markdown("**Unresolved References** *(not found in catalog)*")
                 for ref in unmatched:
-                    label = (
-                        f"`{ref.table}.{ref.column}`"
-                        if ref.column
-                        else f"`{ref.table}.*`"
-                    )
+                    qt = f"{ref.schema}.{ref.table}" if ref.schema else ref.table
+                    label = f"`{qt}.{ref.column}`" if ref.column else f"`{qt}.*`"
                     st.markdown(f"- {label}")
 
             if matched:
