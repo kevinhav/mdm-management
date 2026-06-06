@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import json
 import pathlib
 import time
@@ -21,6 +22,7 @@ st.set_page_config(layout="wide", page_title="MDM Explorer")
 
 # ── Domain model ──────────────────────────────────────────────────────────────
 
+
 @dataclass
 class PhysicalElement:
     id: str
@@ -30,8 +32,8 @@ class PhysicalElement:
     table: str
     column: str
     data_type: str
-    is_nullable: bool = True
-    is_pk: bool = False
+    nullable: bool = True
+    pk: bool = False
     null_pct: float | None = None
 
 
@@ -65,33 +67,35 @@ class Domain:
 
 # ── Pandera schema ────────────────────────────────────────────────────────────
 
+
 class CatalogSchema(pa.DataFrameModel):
-    domain_id:          Series[str]
-    domain_name:        Series[str]
+    domain_id: Series[str]
+    domain_name: Series[str]
     domain_description: Series[str] = pa.Field(nullable=True)
-    domain_owner:       Series[str]
-    entity_id:          Series[str]
-    entity_name:        Series[str]
+    domain_owner: Series[str]
+    entity_id: Series[str]
+    entity_name: Series[str]
     entity_description: Series[str] = pa.Field(nullable=True)
-    entity_steward:     Series[str]
-    le_id:              Series[str]
-    le_name:            Series[str]
-    le_description:     Series[str] = pa.Field(nullable=True)
-    le_aliases:         Series[str] = pa.Field(nullable=True)
-    business_rules:     Series[str] = pa.Field(nullable=True)
-    pe_id:              Series[str] = pa.Field(unique=True)
-    pe_system:          Series[str]
-    pe_database:        Series[str]
-    pe_schema:          Series[str]
-    pe_table:           Series[str]
-    pe_column:          Series[str]
-    pe_data_type:       Series[str]
-    pe_nullable:        Series[bool]
-    pe_pk:              Series[bool]
-    pe_null_pct:        Series[float] = pa.Field(nullable=True, ge=0, le=100)
+    entity_steward: Series[str]
+    le_id: Series[str]
+    le_name: Series[str]
+    le_description: Series[str] = pa.Field(nullable=True)
+    le_aliases: Series[str] = pa.Field(nullable=True)
+    business_rules: Series[str] = pa.Field(nullable=True)
+    pe_id: Series[str] = pa.Field(unique=True)
+    pe_system: Series[str]
+    pe_database: Series[str]
+    pe_schema: Series[str]
+    pe_table: Series[str]
+    pe_column: Series[str]
+    pe_data_type: Series[str]
+    pe_nullable: Series[bool]
+    pe_pk: Series[bool]
+    pe_null_pct: Series[float] = pa.Field(nullable=True, ge=0, le=100)
 
     class Config:
         coerce = True
+        strict = "filter"
 
     @pa.dataframe_check
     @classmethod
@@ -102,12 +106,17 @@ class CatalogSchema(pa.DataFrameModel):
 # ── CSV loader ────────────────────────────────────────────────────────────────
 
 
+@st.cache_data
 def load_from_csv(path: str | pathlib.Path = _HERE / "catalog.csv") -> list[Domain]:
     df = pd.read_csv(path)
     # pandas reads True/False as strings; coerce before pandera sees them
     for col in ("pe_nullable", "pe_pk"):
-        df[col] = df[col].astype(str).str.strip().str.lower().map(
-            {"true": True, "false": False, "1": True, "0": False}
+        df[col] = (
+            df[col]
+            .astype(str)
+            .str.strip()
+            .str.lower()
+            .map({"true": True, "false": False, "1": True, "0": False})
         )
     validated = CatalogSchema.validate(df)
 
@@ -120,48 +129,61 @@ def load_from_csv(path: str | pathlib.Path = _HERE / "catalog.csv") -> list[Doma
             les: list[LogicalElement] = []
             for le_id, le_df in e_df.groupby("le_id", sort=False):
                 le0 = le_df.iloc[0]
+
                 def _split(val) -> list[str]:
-                    return [r.strip() for r in str(val).split("|") if r.strip()] if pd.notna(val) else []
+                    return (
+                        [r.strip() for r in str(val).split("|") if r.strip()]
+                        if pd.notna(val)
+                        else []
+                    )
 
                 aliases = _split(le0["le_aliases"])
                 rules = _split(le0["business_rules"])
-                pes = [
-                    PhysicalElement(
-                        id=str(r["pe_id"]),
-                        system=str(r["pe_system"]),
-                        database=str(r["pe_database"]),
-                        schema=str(r["pe_schema"]),
-                        table=str(r["pe_table"]),
-                        column=str(r["pe_column"]),
-                        data_type=str(r["pe_data_type"]),
-                        is_nullable=bool(r["pe_nullable"]),
-                        is_pk=bool(r["pe_pk"]),
-                        null_pct=float(r["pe_null_pct"]) if pd.notna(r["pe_null_pct"]) else None,
+
+                def _build_pe(r) -> PhysicalElement:
+                    kwargs = {}
+                    for f in dataclasses.fields(PhysicalElement):
+                        val = r[f"pe_{f.name}"]
+                        kwargs[f.name] = (
+                            None if (isinstance(val, float) and pd.isna(val)) else val
+                        )
+                    return PhysicalElement(**kwargs)
+
+                pes = [_build_pe(r) for _, r in le_df.iterrows()]
+                les.append(
+                    LogicalElement(
+                        id=str(le_id),
+                        name=str(le0["le_name"]),
+                        description=str(le0["le_description"])
+                        if pd.notna(le0["le_description"])
+                        else "",
+                        aliases=aliases,
+                        business_rules=rules,
+                        physical_elements=pes,
                     )
-                    for _, r in le_df.iterrows()
-                ]
-                les.append(LogicalElement(
-                    id=str(le_id),
-                    name=str(le0["le_name"]),
-                    description=str(le0["le_description"]) if pd.notna(le0["le_description"]) else "",
-                    aliases=aliases,
-                    business_rules=rules,
-                    physical_elements=pes,
-                ))
-            entities.append(Entity(
-                id=str(e_id),
-                name=str(e0["entity_name"]),
-                description=str(e0["entity_description"]) if pd.notna(e0["entity_description"]) else "",
-                steward=str(e0["entity_steward"]),
-                logical_elements=les,
-            ))
-        domains.append(Domain(
-            id=str(d_id),
-            name=str(d0["domain_name"]),
-            description=str(d0["domain_description"]) if pd.notna(d0["domain_description"]) else "",
-            owner=str(d0["domain_owner"]),
-            entities=entities,
-        ))
+                )
+            entities.append(
+                Entity(
+                    id=str(e_id),
+                    name=str(e0["entity_name"]),
+                    description=str(e0["entity_description"])
+                    if pd.notna(e0["entity_description"])
+                    else "",
+                    steward=str(e0["entity_steward"]),
+                    logical_elements=les,
+                )
+            )
+        domains.append(
+            Domain(
+                id=str(d_id),
+                name=str(d0["domain_name"]),
+                description=str(d0["domain_description"])
+                if pd.notna(d0["domain_description"])
+                else "",
+                owner=str(d0["domain_owner"]),
+                entities=entities,
+            )
+        )
     return domains
 
 
@@ -186,33 +208,30 @@ def flatten_to_df(domains: list[Domain]) -> pd.DataFrame:
     for domain in domains:
         for entity in domain.entities:
             for le in entity.logical_elements:
-                rows.append({
-                    "_id":             le.id,
-                    "domain":          domain.name,
-                    "entity":          entity.name,
-                    "logical_element": le.name,
-                    "aliases":         ", ".join(le.aliases) if le.aliases else "",
-                    "physical_count":  len(le.physical_elements),
-                    "description":     le.description,
-                    "_pe_systems":  " ".join(sorted({pe.system for pe in le.physical_elements})),
-                    "_pe_tables":   " ".join(pe.table  for pe in le.physical_elements),
-                    "_pe_columns":  " ".join(pe.column for pe in le.physical_elements),
-                    "_pe_schemas":  " ".join(sorted({pe.schema for pe in le.physical_elements})),
-                    "detail_data": json.dumps([
-                        {
-                            "system":    pe.system,
-                            "database":  pe.database,
-                            "schema":    pe.schema,
-                            "table":     pe.table,
-                            "column":    pe.column,
-                            "data_type": pe.data_type,
-                            "nullable":  pe.is_nullable,
-                            "pk":        pe.is_pk,
-                            "null_pct":  pe.null_pct,
-                        }
-                        for pe in le.physical_elements
-                    ]),
-                })
+                rows.append(
+                    {
+                        "_id": le.id,
+                        "domain": domain.name,
+                        "entity": entity.name,
+                        "logical_element": le.name,
+                        "aliases": ", ".join(le.aliases) if le.aliases else "",
+                        "physical_count": len(le.physical_elements),
+                        "description": le.description,
+                        "_pe_systems": " ".join(
+                            sorted({pe.system for pe in le.physical_elements})
+                        ),
+                        "_pe_tables": " ".join(pe.table for pe in le.physical_elements),
+                        "_pe_columns": " ".join(
+                            pe.column for pe in le.physical_elements
+                        ),
+                        "_pe_schemas": " ".join(
+                            sorted({pe.schema for pe in le.physical_elements})
+                        ),
+                        "detail_data": json.dumps(
+                            [dataclasses.asdict(pe) for pe in le.physical_elements]
+                        ),
+                    }
+                )
     return pd.DataFrame(rows)
 
 
@@ -222,7 +241,7 @@ def flatten_to_df(domains: list[Domain]) -> pd.DataFrame:
 def generate_sql(pe: PhysicalElement) -> str:
     null_line = (
         f"\n    SUM(CASE WHEN {pe.column} IS NULL THEN 1 ELSE 0 END)  AS null_count,"
-        if pe.is_nullable
+        if pe.nullable
         else ""
     )
     return (
@@ -251,7 +270,9 @@ def typewriter_code(sql: str, placeholder) -> None:
 # ── Detail panel ──────────────────────────────────────────────────────────────
 
 
-def render_detail(le_id: str, le_lookup, entity_lookup, domain_lookup, key_ns: str = ""):
+def render_detail(
+    le_id: str, le_lookup, entity_lookup, domain_lookup, key_ns: str = ""
+):
     le = le_lookup[le_id]
     entity = entity_lookup[le_id]
     domain = domain_lookup[le_id]
@@ -280,8 +301,10 @@ def render_detail(le_id: str, le_lookup, entity_lookup, domain_lookup, key_ns: s
             a, b, c, d = st.columns(4)
             a.markdown(f"**Database**  \n{pe.database}")
             b.markdown(f"**Data Type**  \n{pe.data_type}")
-            c.markdown(f"**Primary Key**  \n{'Yes' if pe.is_pk else 'No'}")
-            d.metric("% Null", f"{pe.null_pct:.1f}%" if pe.null_pct is not None else "—")
+            c.markdown(f"**Primary Key**  \n{'Yes' if pe.pk else 'No'}")
+            d.metric(
+                "% Null", f"{pe.null_pct:.1f}%" if pe.null_pct is not None else "—"
+            )
 
             if st.button("Generate profile SQL", key=f"sql_{key_ns}_{pe.id}"):
                 typewriter_code(generate_sql(pe), st.empty())
@@ -293,7 +316,7 @@ def render_detail(le_id: str, le_lookup, entity_lookup, domain_lookup, key_ns: s
 @dataclass
 class SqlRef:
     table: str
-    column: str | None   # None when SELECT *
+    column: str | None  # None when SELECT *
 
 
 @dataclass
@@ -343,7 +366,9 @@ def parse_sql_refs(sql: str) -> tuple[list[SqlRef], str | None]:
     return refs, None
 
 
-def match_elements(refs: list[SqlRef], domains: list[Domain]) -> tuple[list[MatchedElement], list[SqlRef]]:
+def match_elements(
+    refs: list[SqlRef], domains: list[Domain]
+) -> tuple[list[MatchedElement], list[SqlRef]]:
     matched: list[MatchedElement] = []
     unmatched: list[SqlRef] = []
     seen_pe_ids: set[str] = set()
@@ -355,7 +380,9 @@ def match_elements(refs: list[SqlRef], domains: list[Domain]) -> tuple[list[Matc
                 for le in entity.logical_elements:
                     for pe in le.physical_elements:
                         table_match = pe.table.lower() == ref.table
-                        col_match = ref.column is None or pe.column.lower() == ref.column
+                        col_match = (
+                            ref.column is None or pe.column.lower() == ref.column
+                        )
                         if table_match and col_match and pe.id not in seen_pe_ids:
                             matched.append(MatchedElement(ref, pe, le, entity, domain))
                             seen_pe_ids.add(pe.id)
@@ -364,7 +391,6 @@ def match_elements(refs: list[SqlRef], domains: list[Domain]) -> tuple[list[Matc
             unmatched.append(ref)
 
     return matched, unmatched
-
 
 
 # ── App ───────────────────────────────────────────────────────────────────────
@@ -377,16 +403,48 @@ except Exception as _load_err:
 le_lookup, entity_lookup, domain_lookup = build_lookups(domains)
 df = flatten_to_df(domains)
 
-_ac_terms: list[str] = sorted(set(
-    [d.name for d in domains]
-    + [e.name for d in domains for e in d.entities]
-    + [le.name for d in domains for e in d.entities for le in e.logical_elements]
-    + [alias for d in domains for e in d.entities for le in e.logical_elements for alias in le.aliases]
-    + [pe.system for d in domains for e in d.entities for le in e.logical_elements for pe in le.physical_elements]
-    + [pe.table  for d in domains for e in d.entities for le in e.logical_elements for pe in le.physical_elements]
-    + [pe.column for d in domains for e in d.entities for le in e.logical_elements for pe in le.physical_elements]
-    + [pe.schema for d in domains for e in d.entities for le in e.logical_elements for pe in le.physical_elements]
-))
+_ac_terms: list[str] = sorted(
+    set(
+        [d.name for d in domains]
+        + [e.name for d in domains for e in d.entities]
+        + [le.name for d in domains for e in d.entities for le in e.logical_elements]
+        + [
+            alias
+            for d in domains
+            for e in d.entities
+            for le in e.logical_elements
+            for alias in le.aliases
+        ]
+        + [
+            pe.system
+            for d in domains
+            for e in d.entities
+            for le in e.logical_elements
+            for pe in le.physical_elements
+        ]
+        + [
+            pe.table
+            for d in domains
+            for e in d.entities
+            for le in e.logical_elements
+            for pe in le.physical_elements
+        ]
+        + [
+            pe.column
+            for d in domains
+            for e in d.entities
+            for le in e.logical_elements
+            for pe in le.physical_elements
+        ]
+        + [
+            pe.schema
+            for d in domains
+            for e in d.entities
+            for le in e.logical_elements
+            for pe in le.physical_elements
+        ]
+    )
+)
 
 st.title("MDM Explorer")
 tab_browse, tab_sql = st.tabs(["Browse", "SQL Analyzer"])
@@ -403,12 +461,22 @@ with tab_browse:
     search_query = (selected_term or "").lower()
 
     if search_query:
-        _search_cols = ["logical_element", "aliases", "description",
-                        "_pe_systems", "_pe_tables", "_pe_columns", "_pe_schemas",
-                        "domain", "entity"]
-        _mask = df[_search_cols].apply(
-            lambda col: col.str.contains(search_query, case=False, na=False)
-        ).any(axis=1)
+        _search_cols = [
+            "logical_element",
+            "aliases",
+            "description",
+            "_pe_systems",
+            "_pe_tables",
+            "_pe_columns",
+            "_pe_schemas",
+            "domain",
+            "entity",
+        ]
+        _mask = (
+            df[_search_cols]
+            .apply(lambda col: col.str.contains(search_query, case=False, na=False))
+            .any(axis=1)
+        )
         display_df = df[_mask]
     else:
         display_df = df
@@ -417,13 +485,17 @@ with tab_browse:
 
     with grid_col:
         gb = GridOptionsBuilder.from_dataframe(display_df)
-        gb.configure_column("_id",         hide=True)
-        gb.configure_column("domain",      rowGroup=True, hide=True, enableRowGroup=True, enablePivot=True)
-        gb.configure_column("entity",      rowGroup=True, hide=True, enableRowGroup=True, enablePivot=True)
+        gb.configure_column("_id", hide=True)
+        gb.configure_column(
+            "domain", rowGroup=True, hide=True, enableRowGroup=True, enablePivot=True
+        )
+        gb.configure_column(
+            "entity", rowGroup=True, hide=True, enableRowGroup=True, enablePivot=True
+        )
         gb.configure_column("detail_data", hide=True)
         gb.configure_column("description", hide=True)
         gb.configure_column("_pe_systems", hide=True)
-        gb.configure_column("_pe_tables",  hide=True)
+        gb.configure_column("_pe_tables", hide=True)
         gb.configure_column("_pe_columns", hide=True)
         gb.configure_column("_pe_schemas", hide=True)
         gb.configure_selection("single")
@@ -447,15 +519,19 @@ with tab_browse:
             detailCellRendererParams={
                 "detailGridOptions": {
                     "columnDefs": [
-                        {"field": "system",    "width": 80},
-                        {"field": "database",  "width": 110},
-                        {"field": "schema",    "width": 110},
-                        {"field": "table",     "width": 160},
-                        {"field": "column",    "width": 160},
-                        {"field": "data_type", "headerName": "Type",   "width": 120},
-                        {"field": "pk",        "headerName": "PK",     "width": 55},
-                        {"field": "null_pct",  "headerName": "% Null", "width": 85,
-                         "valueFormatter": "params.value != null ? params.value.toFixed(1) + '%' : '—'"},
+                        {"field": "system", "width": 80},
+                        {"field": "database", "width": 110},
+                        {"field": "schema", "width": 110},
+                        {"field": "table", "width": 160},
+                        {"field": "column", "width": 160},
+                        {"field": "data_type", "headerName": "Type", "width": 120},
+                        {"field": "pk", "headerName": "PK", "width": 55},
+                        {
+                            "field": "null_pct",
+                            "headerName": "% Null",
+                            "width": 85,
+                            "valueFormatter": "params.value != null ? params.value.toFixed(1) + '%' : '—'",
+                        },
                     ],
                     "defaultColDef": {"resizable": True, "sortable": True},
                 },
@@ -483,7 +559,9 @@ with tab_browse:
             selected_id = raw_sel[0].get("_id")
 
         if selected_id and selected_id in le_lookup:
-            render_detail(selected_id, le_lookup, entity_lookup, domain_lookup, key_ns="browse")
+            render_detail(
+                selected_id, le_lookup, entity_lookup, domain_lookup, key_ns="browse"
+            )
         else:
             st.info("Select a logical element row to view details.")
 
@@ -521,7 +599,11 @@ with tab_sql:
             if unmatched:
                 st.markdown("**Unresolved References** *(not found in catalog)*")
                 for ref in unmatched:
-                    label = f"`{ref.table}.{ref.column}`" if ref.column else f"`{ref.table}.*`"
+                    label = (
+                        f"`{ref.table}.{ref.column}`"
+                        if ref.column
+                        else f"`{ref.table}.*`"
+                    )
                     st.markdown(f"- {label}")
 
             if matched:
@@ -531,13 +613,13 @@ with tab_sql:
                 with sql_grid_col:
                     sql_rows = [
                         {
-                            "_le_id":          m.le.id,
-                            "Column":          m.pe.column,
-                            "Table":           m.pe.table,
-                            "System":          m.pe.system,
+                            "_le_id": m.le.id,
+                            "Column": m.pe.column,
+                            "Table": m.pe.table,
+                            "System": m.pe.system,
                             "Logical Element": m.le.name,
-                            "Entity":          m.entity.name,
-                            "Domain":          m.domain.name,
+                            "Entity": m.entity.name,
+                            "Domain": m.domain.name,
                         }
                         for m in matched
                     ]
@@ -563,6 +645,12 @@ with tab_sql:
                         sql_le_id = sql_sel[0].get("_le_id")
 
                     if sql_le_id and sql_le_id in le_lookup:
-                        render_detail(sql_le_id, le_lookup, entity_lookup, domain_lookup, key_ns="sql")
+                        render_detail(
+                            sql_le_id,
+                            le_lookup,
+                            entity_lookup,
+                            domain_lookup,
+                            key_ns="sql",
+                        )
                     else:
                         st.info("Click a row to view the logical element detail.")
