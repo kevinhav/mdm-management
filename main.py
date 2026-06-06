@@ -1,17 +1,25 @@
 from __future__ import annotations
 
 import json
+import pathlib
 import time
-from dataclasses import dataclass, field
+from dataclasses import field
+from typing import cast
 
 import pandas as pd
+import pandera.pandas as pa
+import sqlglot
+import sqlglot.expressions as exp
 import streamlit as st
+from pandera.typing.pandas import Series
+from pydantic.dataclasses import dataclass
 from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, JsCode
+
+_HERE = pathlib.Path(__file__).parent
 
 st.set_page_config(layout="wide", page_title="MDM Explorer")
 
-# ── Dataclasses ───────────────────────────────────────────────────────────────
-
+# ── Domain model ──────────────────────────────────────────────────────────────
 
 @dataclass
 class PhysicalElement:
@@ -24,6 +32,7 @@ class PhysicalElement:
     data_type: str
     is_nullable: bool = True
     is_pk: bool = False
+    null_pct: float | None = None
 
 
 @dataclass
@@ -31,8 +40,7 @@ class LogicalElement:
     id: str
     name: str
     description: str
-    data_type: str
-    is_required: bool
+    aliases: list[str] = field(default_factory=list)
     business_rules: list[str] = field(default_factory=list)
     physical_elements: list[PhysicalElement] = field(default_factory=list)
 
@@ -55,132 +63,106 @@ class Domain:
     entities: list[Entity] = field(default_factory=list)
 
 
-# ── Mock data ─────────────────────────────────────────────────────────────────
+# ── Pandera schema ────────────────────────────────────────────────────────────
+
+class CatalogSchema(pa.DataFrameModel):
+    domain_id:          Series[str]
+    domain_name:        Series[str]
+    domain_description: Series[str] = pa.Field(nullable=True)
+    domain_owner:       Series[str]
+    entity_id:          Series[str]
+    entity_name:        Series[str]
+    entity_description: Series[str] = pa.Field(nullable=True)
+    entity_steward:     Series[str]
+    le_id:              Series[str]
+    le_name:            Series[str]
+    le_description:     Series[str] = pa.Field(nullable=True)
+    le_aliases:         Series[str] = pa.Field(nullable=True)
+    business_rules:     Series[str] = pa.Field(nullable=True)
+    pe_id:              Series[str] = pa.Field(unique=True)
+    pe_system:          Series[str]
+    pe_database:        Series[str]
+    pe_schema:          Series[str]
+    pe_table:           Series[str]
+    pe_column:          Series[str]
+    pe_data_type:       Series[str]
+    pe_nullable:        Series[bool]
+    pe_pk:              Series[bool]
+    pe_null_pct:        Series[float] = pa.Field(nullable=True, ge=0, le=100)
+
+    class Config:
+        coerce = True
+
+    @pa.dataframe_check
+    @classmethod
+    def le_id_maps_to_one_name(cls, df: pd.DataFrame) -> bool:
+        return bool(df.groupby("le_id")["le_name"].nunique().le(1).all())
 
 
-def _pe(id, system, db, schema, table, column, dtype, nullable=True, pk=False):
-    return PhysicalElement(id, system, db, schema, table, column, dtype, nullable, pk)
+# ── CSV loader ────────────────────────────────────────────────────────────────
 
 
-def build_domains() -> list[Domain]:
-    return [
-        Domain("d1", "Customer", "All customer-related data assets", "Sarah Chen", entities=[
-            Entity("e1", "Profile", "Core customer identity attributes", "James Kim", logical_elements=[
-                LogicalElement("l1", "Customer ID", "Unique identifier for a customer", "String", True,
-                    ["Must be globally unique", "Immutable once assigned"],
-                    [
-                        _pe("p1",  "CRM", "crm_db", "dbo",       "customers",        "cust_id",      "VARCHAR(20)", False, True),
-                        _pe("p2",  "ERP", "erp_db", "master",    "customer_master",   "cust_num",     "CHAR(10)",   False, True),
-                        _pe("p3",  "DWH", "dw_db",  "analytics", "dim_customer",      "customer_key", "INTEGER",    False, True),
-                    ]),
-                LogicalElement("l2", "First Name", "Customer's given name", "String", True,
-                    ["Max 50 characters", "No numeric characters"],
-                    [
-                        _pe("p4", "CRM", "crm_db", "dbo",       "customers",    "first_nm",   "VARCHAR(50)"),
-                        _pe("p5", "DWH", "dw_db",  "analytics", "dim_customer", "first_name", "VARCHAR(50)"),
-                    ]),
-                LogicalElement("l3", "Date of Birth", "Customer's date of birth", "Date", False,
-                    ["Must be a valid past date", "Used for age verification"],
-                    [
-                        _pe("p6", "CRM", "crm_db", "dbo",       "customers",    "dob",        "DATE"),
-                        _pe("p7", "DWH", "dw_db",  "analytics", "dim_customer", "birth_date", "DATE"),
-                    ]),
-                LogicalElement("l4", "Membership Status", "Current membership tier", "String", True,
-                    ["Values: ACTIVE, INACTIVE, SUSPENDED, PENDING"],
-                    [
-                        _pe("p8", "CRM", "crm_db", "dbo",    "customers",        "status_cd", "CHAR(2)"),
-                        _pe("p9", "ERP", "erp_db", "master", "customer_master",  "status",    "VARCHAR(10)"),
-                    ]),
-            ]),
-            Entity("e2", "Contact", "Customer contact information", "Ana Lopez", logical_elements=[
-                LogicalElement("l5", "Email Address", "Primary email address", "String", False,
-                    ["Must conform to RFC 5322", "Unique per customer"],
-                    [
-                        _pe("p10", "CRM", "crm_db", "dbo", "customer_contact", "email",      "VARCHAR(255)"),
-                        _pe("p11", "MDM", "mdm_db", "hub", "contact_hub",      "email_addr", "VARCHAR(255)"),
-                    ]),
-                LogicalElement("l6", "Phone Number", "Primary contact phone", "String", False,
-                    ["E.164 format required", "Includes country code"],
-                    [
-                        _pe("p12", "CRM", "crm_db", "dbo", "customer_contact", "phone_num", "VARCHAR(20)"),
-                        _pe("p13", "MDM", "mdm_db", "hub", "contact_hub",      "phone",     "VARCHAR(20)"),
-                    ]),
-            ]),
-        ]),
-        Domain("d2", "Finance", "Financial data assets and transactions", "Marcus Rivera", entities=[
-            Entity("e3", "Transaction", "Monetary transaction records", "Wei Zhang", logical_elements=[
-                LogicalElement("l7", "Transaction ID", "Unique transaction identifier", "String", True,
-                    ["UUID format", "System-generated, never reused"],
-                    [
-                        _pe("p14", "ERP", "erp_db", "finance",   "transactions",     "txn_id",          "VARCHAR(36)", False, True),
-                        _pe("p15", "DWH", "dw_db",  "analytics", "fact_transaction", "transaction_key", "BIGINT",      False, True),
-                    ]),
-                LogicalElement("l8", "Amount", "Transaction monetary value", "Decimal", True,
-                    ["Precision: 18,2", "Must be positive for credits"],
-                    [
-                        _pe("p16", "ERP", "erp_db", "finance",   "transactions",     "txn_amt", "DECIMAL(18,2)"),
-                        _pe("p17", "DWH", "dw_db",  "analytics", "fact_transaction", "amount",  "NUMERIC(18,2)"),
-                    ]),
-                LogicalElement("l9", "Transaction Date", "Date the transaction occurred", "Date", True,
-                    ["Cannot be a future date"],
-                    [
-                        _pe("p18", "ERP", "erp_db", "finance",   "transactions",     "txn_dt",           "DATE"),
-                        _pe("p19", "DWH", "dw_db",  "analytics", "fact_transaction", "transaction_date", "DATE"),
-                    ]),
-            ]),
-            Entity("e4", "Account", "Customer financial accounts", "Wei Zhang", logical_elements=[
-                LogicalElement("l10", "Account Number", "Unique account identifier", "String", True,
-                    ["Alphanumeric, 12 characters", "Luhn-validated"],
-                    [
-                        _pe("p20", "ERP", "erp_db", "finance", "accounts", "acct_num",   "CHAR(12)",    False, True),
-                        _pe("p21", "CRM", "crm_db", "dbo",     "accounts", "account_id", "VARCHAR(12)", False, True),
-                    ]),
-                LogicalElement("l11", "Account Type", "Category of account", "String", True,
-                    ["Values: CHECKING, SAVINGS, CREDIT, INVESTMENT"],
-                    [
-                        _pe("p22", "ERP", "erp_db", "finance",   "accounts",    "acct_type_cd", "CHAR(3)"),
-                        _pe("p23", "DWH", "dw_db",  "analytics", "dim_account", "account_type", "VARCHAR(20)"),
-                    ]),
-            ]),
-        ]),
-        Domain("d3", "Product", "Product catalog and inventory data", "Priya Patel", entities=[
-            Entity("e5", "Catalog", "Product definition and classification", "Tom Bradley", logical_elements=[
-                LogicalElement("l12", "Product ID", "Unique product identifier", "String", True,
-                    ["GTIN format", "Issued by product steward"],
-                    [
-                        _pe("p24", "ERP", "erp_db", "product",   "products",    "prod_id",     "VARCHAR(14)", False, True),
-                        _pe("p25", "DWH", "dw_db",  "analytics", "dim_product", "product_key", "INTEGER",     False, True),
-                        _pe("p26", "MDM", "mdm_db", "hub",       "product_hub", "product_id",  "VARCHAR(14)", False, True),
-                    ]),
-                LogicalElement("l13", "Product Name", "Commercial name of the product", "String", True,
-                    ["Max 200 characters", "Unique within category"],
-                    [
-                        _pe("p27", "ERP", "erp_db", "product",   "products",    "prod_nm",      "VARCHAR(200)"),
-                        _pe("p28", "DWH", "dw_db",  "analytics", "dim_product", "product_name", "VARCHAR(200)"),
-                    ]),
-                LogicalElement("l14", "Category", "Product classification category", "String", True,
-                    ["Must match approved category taxonomy"],
-                    [
-                        _pe("p29", "ERP", "erp_db", "product",   "products",    "cat_cd",        "VARCHAR(50)"),
-                        _pe("p30", "DWH", "dw_db",  "analytics", "dim_product", "category_name", "VARCHAR(100)"),
-                    ]),
-            ]),
-            Entity("e6", "Inventory", "Stock levels and warehouse data", "Tom Bradley", logical_elements=[
-                LogicalElement("l15", "SKU", "Stock keeping unit identifier", "String", True,
-                    ["Alphanumeric, up to 20 characters", "Unique per warehouse location"],
-                    [
-                        _pe("p31", "ERP", "erp_db", "inventory", "stock",          "sku_cd", "VARCHAR(20)", False, True),
-                        _pe("p32", "DWH", "dw_db",  "analytics", "fact_inventory", "sku",    "VARCHAR(20)"),
-                    ]),
-                LogicalElement("l16", "Stock Level", "Current quantity on hand", "Integer", True,
-                    ["Cannot be negative", "Triggers reorder at configured threshold"],
-                    [
-                        _pe("p33", "ERP", "erp_db", "inventory", "stock",          "qty_on_hand",      "INTEGER"),
-                        _pe("p34", "DWH", "dw_db",  "analytics", "fact_inventory", "quantity_on_hand", "INTEGER"),
-                    ]),
-            ]),
-        ]),
-    ]
+def load_from_csv(path: str | pathlib.Path = _HERE / "catalog.csv") -> list[Domain]:
+    df = pd.read_csv(path)
+    # pandas reads True/False as strings; coerce before pandera sees them
+    for col in ("pe_nullable", "pe_pk"):
+        df[col] = df[col].astype(str).str.strip().str.lower().map(
+            {"true": True, "false": False, "1": True, "0": False}
+        )
+    validated = CatalogSchema.validate(df)
+
+    domains: list[Domain] = []
+    for d_id, d_df in validated.groupby("domain_id", sort=False):
+        d0 = d_df.iloc[0]
+        entities: list[Entity] = []
+        for e_id, e_df in d_df.groupby("entity_id", sort=False):
+            e0 = e_df.iloc[0]
+            les: list[LogicalElement] = []
+            for le_id, le_df in e_df.groupby("le_id", sort=False):
+                le0 = le_df.iloc[0]
+                def _split(val) -> list[str]:
+                    return [r.strip() for r in str(val).split("|") if r.strip()] if pd.notna(val) else []
+
+                aliases = _split(le0["le_aliases"])
+                rules = _split(le0["business_rules"])
+                pes = [
+                    PhysicalElement(
+                        id=str(r["pe_id"]),
+                        system=str(r["pe_system"]),
+                        database=str(r["pe_database"]),
+                        schema=str(r["pe_schema"]),
+                        table=str(r["pe_table"]),
+                        column=str(r["pe_column"]),
+                        data_type=str(r["pe_data_type"]),
+                        is_nullable=bool(r["pe_nullable"]),
+                        is_pk=bool(r["pe_pk"]),
+                        null_pct=float(r["pe_null_pct"]) if pd.notna(r["pe_null_pct"]) else None,
+                    )
+                    for _, r in le_df.iterrows()
+                ]
+                les.append(LogicalElement(
+                    id=str(le_id),
+                    name=str(le0["le_name"]),
+                    description=str(le0["le_description"]) if pd.notna(le0["le_description"]) else "",
+                    aliases=aliases,
+                    business_rules=rules,
+                    physical_elements=pes,
+                ))
+            entities.append(Entity(
+                id=str(e_id),
+                name=str(e0["entity_name"]),
+                description=str(e0["entity_description"]) if pd.notna(e0["entity_description"]) else "",
+                steward=str(e0["entity_steward"]),
+                logical_elements=les,
+            ))
+        domains.append(Domain(
+            id=str(d_id),
+            name=str(d0["domain_name"]),
+            description=str(d0["domain_description"]) if pd.notna(d0["domain_description"]) else "",
+            owner=str(d0["domain_owner"]),
+            entities=entities,
+        ))
+    return domains
 
 
 # ── Lookups and DataFrame ─────────────────────────────────────────────────────
@@ -209,10 +191,13 @@ def flatten_to_df(domains: list[Domain]) -> pd.DataFrame:
                     "domain":          domain.name,
                     "entity":          entity.name,
                     "logical_element": le.name,
-                    "data_type":       le.data_type,
-                    "required":        "Yes" if le.is_required else "No",
+                    "aliases":         ", ".join(le.aliases) if le.aliases else "",
                     "physical_count":  len(le.physical_elements),
                     "description":     le.description,
+                    "_pe_systems":  " ".join(sorted({pe.system for pe in le.physical_elements})),
+                    "_pe_tables":   " ".join(pe.table  for pe in le.physical_elements),
+                    "_pe_columns":  " ".join(pe.column for pe in le.physical_elements),
+                    "_pe_schemas":  " ".join(sorted({pe.schema for pe in le.physical_elements})),
                     "detail_data": json.dumps([
                         {
                             "system":    pe.system,
@@ -223,6 +208,7 @@ def flatten_to_df(domains: list[Domain]) -> pd.DataFrame:
                             "data_type": pe.data_type,
                             "nullable":  pe.is_nullable,
                             "pk":        pe.is_pk,
+                            "null_pct":  pe.null_pct,
                         }
                         for pe in le.physical_elements
                     ]),
@@ -265,7 +251,7 @@ def typewriter_code(sql: str, placeholder) -> None:
 # ── Detail panel ──────────────────────────────────────────────────────────────
 
 
-def render_detail(le_id: str, le_lookup, entity_lookup, domain_lookup):
+def render_detail(le_id: str, le_lookup, entity_lookup, domain_lookup, key_ns: str = ""):
     le = le_lookup[le_id]
     entity = entity_lookup[le_id]
     domain = domain_lookup[le_id]
@@ -274,13 +260,14 @@ def render_detail(le_id: str, le_lookup, entity_lookup, domain_lookup):
     st.caption(f"{domain.name} › {entity.name}  ·  Steward: {entity.steward}")
     st.divider()
 
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Data Type", le.data_type)
-    c2.metric("Required", "Yes" if le.is_required else "No")
-    c3.metric("Physical Mappings", len(le.physical_elements))
+    st.metric("Physical Mappings", len(le.physical_elements))
 
     st.markdown("**Description**")
     st.write(le.description)
+
+    if le.aliases:
+        st.markdown("**Also known as**")
+        st.markdown("  ".join(f"`{a}`" for a in le.aliases))
 
     if le.business_rules:
         st.markdown("**Business Rules**")
@@ -290,71 +277,172 @@ def render_detail(le_id: str, le_lookup, entity_lookup, domain_lookup):
     st.markdown("**Physical Manifestations**")
     for pe in le.physical_elements:
         with st.expander(f"{pe.system}  ·  `{pe.schema}.{pe.table}.{pe.column}`"):
-            a, b, c = st.columns(3)
+            a, b, c, d = st.columns(4)
             a.markdown(f"**Database**  \n{pe.database}")
             b.markdown(f"**Data Type**  \n{pe.data_type}")
             c.markdown(f"**Primary Key**  \n{'Yes' if pe.is_pk else 'No'}")
+            d.metric("% Null", f"{pe.null_pct:.1f}%" if pe.null_pct is not None else "—")
 
-            if st.button("Generate profile SQL", key=f"sql_{pe.id}"):
+            if st.button("Generate profile SQL", key=f"sql_{key_ns}_{pe.id}"):
                 typewriter_code(generate_sql(pe), st.empty())
+
+
+# ── SQL analyzer ─────────────────────────────────────────────────────────────
+
+
+@dataclass
+class SqlRef:
+    table: str
+    column: str | None   # None when SELECT *
+
+
+@dataclass
+class MatchedElement:
+    ref: SqlRef
+    pe: PhysicalElement
+    le: LogicalElement
+    entity: Entity
+    domain: Domain
+
+
+def parse_sql_refs(sql: str) -> tuple[list[SqlRef], str | None]:
+    """Parse SQL and return (references, error). References are (table, column) pairs."""
+    try:
+        parsed = sqlglot.parse_one(sql, error_level=sqlglot.ErrorLevel.RAISE)
+    except Exception as e:
+        return [], str(e)
+
+    # Build alias map: alias/name → table name (lowercased)
+    alias_map: dict[str, str] = {}
+    for table_node in parsed.find_all(exp.Table):
+        name = table_node.name.lower()
+        alias = table_node.alias.lower() if table_node.alias else name
+        alias_map[alias] = name
+        alias_map[name] = name
+
+    refs: list[SqlRef] = []
+
+    # SELECT * → emit table-only refs for all referenced tables
+    if parsed.find(exp.Star):
+        for table_name in set(alias_map.values()):
+            refs.append(SqlRef(table=table_name, column=None))
+
+    # Named column references
+    for col_node in parsed.find_all(exp.Column):
+        col_name = col_node.name.lower()
+        qualifier = col_node.table.lower() if col_node.table else None
+        if qualifier and qualifier in alias_map:
+            refs.append(SqlRef(table=alias_map[qualifier], column=col_name))
+        elif qualifier:
+            refs.append(SqlRef(table=qualifier, column=col_name))
+        else:
+            # Unqualified column — could belong to any referenced table
+            for table_name in set(alias_map.values()):
+                refs.append(SqlRef(table=table_name, column=col_name))
+
+    return refs, None
+
+
+def match_elements(refs: list[SqlRef], domains: list[Domain]) -> tuple[list[MatchedElement], list[SqlRef]]:
+    matched: list[MatchedElement] = []
+    unmatched: list[SqlRef] = []
+    seen_pe_ids: set[str] = set()
+
+    for ref in refs:
+        found = False
+        for domain in domains:
+            for entity in domain.entities:
+                for le in entity.logical_elements:
+                    for pe in le.physical_elements:
+                        table_match = pe.table.lower() == ref.table
+                        col_match = ref.column is None or pe.column.lower() == ref.column
+                        if table_match and col_match and pe.id not in seen_pe_ids:
+                            matched.append(MatchedElement(ref, pe, le, entity, domain))
+                            seen_pe_ids.add(pe.id)
+                            found = True
+        if not found and ref not in unmatched:
+            unmatched.append(ref)
+
+    return matched, unmatched
+
 
 
 # ── App ───────────────────────────────────────────────────────────────────────
 
-domains = build_domains()
+try:
+    domains = load_from_csv()
+except Exception as _load_err:
+    st.error(f"Failed to load catalog.csv: {_load_err}")
+    st.stop()
 le_lookup, entity_lookup, domain_lookup = build_lookups(domains)
 df = flatten_to_df(domains)
 
+_ac_terms: list[str] = sorted(set(
+    [d.name for d in domains]
+    + [e.name for d in domains for e in d.entities]
+    + [le.name for d in domains for e in d.entities for le in e.logical_elements]
+    + [alias for d in domains for e in d.entities for le in e.logical_elements for alias in le.aliases]
+    + [pe.system for d in domains for e in d.entities for le in e.logical_elements for pe in le.physical_elements]
+    + [pe.table  for d in domains for e in d.entities for le in e.logical_elements for pe in le.physical_elements]
+    + [pe.column for d in domains for e in d.entities for le in e.logical_elements for pe in le.physical_elements]
+    + [pe.schema for d in domains for e in d.entities for le in e.logical_elements for pe in le.physical_elements]
+))
+
 st.title("MDM Explorer")
-tab_search, tab_browse = st.tabs(["Search", "Browse"])
-
-# ── Search ────────────────────────────────────────────────────────────────────
-with tab_search:
-    query = st.text_input("Search elements", placeholder="e.g. customer, email, amount...")
-
-    if query:
-        q = query.lower()
-        results = []
-        for domain in domains:
-            for entity in domain.entities:
-                for le in entity.logical_elements:
-                    if q in le.name.lower() or q in le.description.lower():
-                        results.append({
-                            "Type": "Logical Element", "Name": le.name,
-                            "Domain": domain.name, "Entity": entity.name,
-                            "Data Type": le.data_type, "Description": le.description,
-                        })
-                    for pe in le.physical_elements:
-                        if q in pe.column.lower() or q in pe.table.lower() or q in pe.system.lower():
-                            results.append({
-                                "Type": "Physical Element", "Name": pe.column,
-                                "Domain": domain.name, "Entity": entity.name,
-                                "Data Type": pe.data_type,
-                                "Description": f"{pe.system} · {pe.schema}.{pe.table}",
-                            })
-        if results:
-            st.caption(f"{len(results)} result(s)")
-            st.dataframe(pd.DataFrame(results), use_container_width=True, hide_index=True)
-        else:
-            st.warning("No results found.")
+tab_browse, tab_sql = st.tabs(["Browse", "SQL Analyzer"])
 
 # ── Browse ────────────────────────────────────────────────────────────────────
 with tab_browse:
+    selected_term = st.selectbox(
+        "Search",
+        options=_ac_terms,
+        index=None,
+        placeholder="Filter by element name, type, domain…",
+        label_visibility="collapsed",
+    )
+    search_query = (selected_term or "").lower()
+
+    if search_query:
+        _search_cols = ["logical_element", "aliases", "description",
+                        "_pe_systems", "_pe_tables", "_pe_columns", "_pe_schemas",
+                        "domain", "entity"]
+        _mask = df[_search_cols].apply(
+            lambda col: col.str.contains(search_query, case=False, na=False)
+        ).any(axis=1)
+        display_df = df[_mask]
+    else:
+        display_df = df
+
     grid_col, detail_col = st.columns([3, 2])
 
     with grid_col:
-        gb = GridOptionsBuilder.from_dataframe(df)
+        gb = GridOptionsBuilder.from_dataframe(display_df)
         gb.configure_column("_id",         hide=True)
-        gb.configure_column("domain",      rowGroup=True, hide=True)
-        gb.configure_column("entity",      rowGroup=True, hide=True)
+        gb.configure_column("domain",      rowGroup=True, hide=True, enableRowGroup=True, enablePivot=True)
+        gb.configure_column("entity",      rowGroup=True, hide=True, enableRowGroup=True, enablePivot=True)
         gb.configure_column("detail_data", hide=True)
         gb.configure_column("description", hide=True)
+        gb.configure_column("_pe_systems", hide=True)
+        gb.configure_column("_pe_tables",  hide=True)
+        gb.configure_column("_pe_columns", hide=True)
+        gb.configure_column("_pe_schemas", hide=True)
         gb.configure_selection("single")
         gb.configure_grid_options(
             masterDetail=True,
             animateRows=True,
             groupDefaultExpanded=1,
-            autoGroupColumnDef={"field": "logical_element", "headerName": "Element", "minWidth": 240},
+            sideBar={"toolPanels": ["columns", "filters"]},
+            rowGroupPanelShow="always",
+            autoGroupColumnDef={
+                "field": "logical_element",
+                "headerName": "Element",
+                "minWidth": 240,
+                "cellStyle": JsCode("""function(params) {
+                    if (!params.node.group) {
+                        return {color: '#4C72B0', textDecoration: 'underline', cursor: 'pointer', fontWeight: 500};
+                    }
+                }"""),
+            },
             detailRowHeight=200,
             detailCellRendererParams={
                 "detailGridOptions": {
@@ -364,8 +452,10 @@ with tab_browse:
                         {"field": "schema",    "width": 110},
                         {"field": "table",     "width": 160},
                         {"field": "column",    "width": 160},
-                        {"field": "data_type", "headerName": "Type", "width": 130},
-                        {"field": "pk",        "headerName": "PK",   "width": 60},
+                        {"field": "data_type", "headerName": "Type",   "width": 120},
+                        {"field": "pk",        "headerName": "PK",     "width": 55},
+                        {"field": "null_pct",  "headerName": "% Null", "width": 85,
+                         "valueFormatter": "params.value != null ? params.value.toFixed(1) + '%' : '—'"},
                     ],
                     "defaultColDef": {"resizable": True, "sortable": True},
                 },
@@ -375,7 +465,7 @@ with tab_browse:
             },
         )
         grid_response = AgGrid(
-            df,
+            display_df,
             gridOptions=gb.build(),
             allow_unsafe_jscode=True,
             enable_enterprise_modules=True,
@@ -393,6 +483,86 @@ with tab_browse:
             selected_id = raw_sel[0].get("_id")
 
         if selected_id and selected_id in le_lookup:
-            render_detail(selected_id, le_lookup, entity_lookup, domain_lookup)
+            render_detail(selected_id, le_lookup, entity_lookup, domain_lookup, key_ns="browse")
         else:
             st.info("Select a logical element row to view details.")
+
+# ── SQL Analyzer ──────────────────────────────────────────────────────────────
+with tab_sql:
+    st.session_state.setdefault("sql_results", None)
+
+    sql_input = st.text_area(
+        "Paste a SQL query",
+        height=200,
+        placeholder="SELECT c.cust_id, c.first_nm\nFROM dbo.customers c\nJOIN master.customer_master cm ON c.cust_id = cm.cust_num",
+    )
+
+    if st.button("Analyze", type="primary", disabled=not sql_input.strip()):
+        refs, error = parse_sql_refs(sql_input)
+        if error:
+            st.session_state.sql_results = {"error": error}
+        else:
+            matched, unmatched = match_elements(refs, domains)
+            st.session_state.sql_results = {"matched": matched, "unmatched": unmatched}
+
+    results = st.session_state.sql_results
+    if results is not None:
+        if "error" in results:
+            st.error(f"Could not parse SQL: {results['error']}")
+        else:
+            matched = cast(list[MatchedElement], results["matched"])
+            unmatched = cast(list[SqlRef], results["unmatched"])
+
+            c1, c2 = st.columns(2)
+            c1.metric("Catalog matches", len(matched))
+            c2.metric("Unresolved references", len(unmatched))
+            st.divider()
+
+            if unmatched:
+                st.markdown("**Unresolved References** *(not found in catalog)*")
+                for ref in unmatched:
+                    label = f"`{ref.table}.{ref.column}`" if ref.column else f"`{ref.table}.*`"
+                    st.markdown(f"- {label}")
+
+            if matched:
+                st.markdown("**Matched Data Elements**")
+                sql_grid_col, sql_detail_col = st.columns([3, 2])
+
+                with sql_grid_col:
+                    sql_rows = [
+                        {
+                            "_le_id":          m.le.id,
+                            "Column":          m.pe.column,
+                            "Table":           m.pe.table,
+                            "System":          m.pe.system,
+                            "Logical Element": m.le.name,
+                            "Entity":          m.entity.name,
+                            "Domain":          m.domain.name,
+                        }
+                        for m in matched
+                    ]
+                    sql_df = pd.DataFrame(sql_rows)
+                    sql_gb = GridOptionsBuilder.from_dataframe(sql_df)
+                    sql_gb.configure_column("_le_id", hide=True)
+                    sql_gb.configure_selection("single")
+                    sql_response = AgGrid(
+                        sql_df,
+                        gridOptions=sql_gb.build(),
+                        allow_unsafe_jscode=True,
+                        update_mode=GridUpdateMode.SELECTION_CHANGED,
+                        height=min(200 + len(matched) * 42, 500),
+                    )
+
+                with sql_detail_col:
+                    sql_sel = sql_response.selected_rows
+                    sql_le_id = None
+                    if isinstance(sql_sel, pd.DataFrame):
+                        if len(sql_sel) > 0:
+                            sql_le_id = sql_sel.iloc[0].get("_le_id")
+                    elif isinstance(sql_sel, list) and sql_sel:
+                        sql_le_id = sql_sel[0].get("_le_id")
+
+                    if sql_le_id and sql_le_id in le_lookup:
+                        render_detail(sql_le_id, le_lookup, entity_lookup, domain_lookup, key_ns="sql")
+                    else:
+                        st.info("Click a row to view the logical element detail.")
