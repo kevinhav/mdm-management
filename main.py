@@ -345,21 +345,30 @@ def parse_sql_refs(sql: str) -> tuple[list[SqlRef], str | None]:
 
     refs: list[SqlRef] = []
 
-    # SELECT * → emit table-only refs for all referenced tables
-    if parsed.find(exp.Star):
+    # SELECT * → only triggers when Star is a direct SELECT expression, not inside COUNT(*)
+    select_node = parsed.find(exp.Select)
+    if select_node and any(isinstance(e, exp.Star) for e in select_node.expressions):
         for table_name in set(alias_map.values()):
             refs.append(SqlRef(table=table_name, column=None))
 
-    # Named column references
+    # Collect SELECT-clause aliases so ORDER BY / HAVING alias refs don't leak through
+    select_aliases = {
+        node.alias.lower()
+        for node in (select_node.expressions if select_node else [])
+        if isinstance(node, exp.Alias) and node.alias
+    }
+
+    # Named column references — skip aliases defined in the SELECT clause
     for col_node in parsed.find_all(exp.Column):
         col_name = col_node.name.lower()
+        if col_name in select_aliases:
+            continue
         qualifier = col_node.table.lower() if col_node.table else None
         if qualifier and qualifier in alias_map:
             refs.append(SqlRef(table=alias_map[qualifier], column=col_name))
         elif qualifier:
             refs.append(SqlRef(table=qualifier, column=col_name))
         else:
-            # Unqualified column — could belong to any referenced table
             for table_name in set(alias_map.values()):
                 refs.append(SqlRef(table=table_name, column=col_name))
 
