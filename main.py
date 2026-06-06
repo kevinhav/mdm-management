@@ -372,7 +372,15 @@ def parse_sql_refs(sql: str) -> tuple[list[SqlRef], str | None]:
             for table_name in set(alias_map.values()):
                 refs.append(SqlRef(table=table_name, column=col_name))
 
-    return refs, None
+    # Deduplicate: same column referenced multiple times (SELECT, WHERE, GROUP BY, etc.)
+    seen: set[tuple] = set()
+    unique_refs: list[SqlRef] = []
+    for r in refs:
+        key = (r.table, r.column)
+        if key not in seen:
+            seen.add(key)
+            unique_refs.append(r)
+    return unique_refs, None
 
 
 def match_elements(
